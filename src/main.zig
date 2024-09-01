@@ -22,8 +22,7 @@ pub fn main() !u8 {
     };
 
     const pid = try std.posix.fork();
-    if (pid == 0) {
-        // child
+    if (pid == 0) { // child
         try std.posix.ptrace(
             std.os.linux.PTRACE.TRACEME,
             0,
@@ -32,52 +31,23 @@ pub fn main() !u8 {
         );
         return std.posix.execveZ(program_to_execute, &.{program_to_execute}, &.{null});
     } else if (pid >= 1) { // parent
-
         const file = try std.fs.cwd().openFile(program_to_execute, .{});
-        const elf_header = try std.elf.Header.read(file);
+        var dwarf = try readDwarf(arena, file);
 
-        const table = try elfGetSectionStringTable(arena, elf_header, file) orelse {
-            std.log.err("Can't find string table", .{});
-            return 1;
-        };
-
-        var iter = elf_header.section_header_iterator(file);
-        var sections_array = std.debug.Dwarf.null_section_array;
-        while (try iter.next()) |section| {
-            if (section.sh_type != std.elf.SHT_NULL) {
-                const name = std.mem.span(@as([*:0]u8, @ptrCast(&table[section.sh_name])));
-                const id = std.meta.stringToEnum(
-                    std.debug.Dwarf.Section.Id,
-                    name[1..],
-                ) orelse continue; // Remove .
-                const buf = try arena.alloc(u8, section.sh_size);
-                try file.seekTo(section.sh_offset);
-                _ = try file.readAll(buf);
-                sections_array[@intFromEnum(id)] = std.debug.Dwarf.Section{
-                    .data = buf,
-                    .virtual_address = null,
-                    .owned = false,
-                };
-
-                std.debug.print("Read {any}\n", .{id});
-            }
+        for (dwarf.fde_list.items) |func| {
+            std.debug.print("{any}\n", .{func});
         }
 
-        var dwarf = std.debug.Dwarf{
-            .sections = sections_array,
-            .endian = .little,
-            .is_macho = false,
-        };
-        try dwarf.open(gpa);
-        defer dwarf.deinit(gpa);
-        for (dwarf.func_list.items) |func| {
-            std.debug.print("{?s}\n", .{func.name});
-        }
+        debug(
+            program_to_execute,
+            pid,
+            &dwarf,
+        );
     }
     return 0;
 }
 
-fn debug(debugge_name: []const u8, debugge_pid: i32) void {
+fn debug(debugge_name: []const u8, debugge_pid: i32, dwarf: *std.debug.Dwarf) void {
     _ = debugge_name;
     const res = std.posix.waitpid(debugge_pid, 0);
     std.log.info("waited for pid {d}", .{res.pid});
@@ -88,6 +58,7 @@ fn debug(debugge_name: []const u8, debugge_pid: i32) void {
     var buffer: [256]u8 = undefined;
 
     var old_regs: user_regs_struct = std.mem.zeroes(user_regs_struct);
+    var old_name: []const u8 = "";
 
     while (blk: {
         stdout.writeAll("zugger> ") catch |err| {
@@ -97,23 +68,32 @@ fn debug(debugge_name: []const u8, debugge_pid: i32) void {
     }) |line| {
         var tokens = std.mem.tokenizeScalar(u8, line, ' ');
         const command = tokens.next() orelse "step";
-        if (std.mem.startsWith(u8, "continue", command)) {
-            continueExecution(debugge_pid) catch |err| {
+        while (true) {
+            if (std.mem.startsWith(u8, "continue", command)) {
+                continueExecution(debugge_pid) catch |err| {
+                    std.log.err("Failed to continue execution: {s}", .{@errorName(err)});
+                };
+                continue;
+            }
+            if (std.mem.startsWith(u8, "step", command)) {
+                step(debugge_pid) catch |err| {
+                    std.log.err("Failed to continue execution: {s}", .{@errorName(err)});
+                    return;
+                };
+            }
+            const regs = getRegisters(debugge_pid) catch |err| {
                 std.log.err("Failed to continue execution: {s}", .{@errorName(err)});
+                continue;
             };
-            continue;
+            const name = dwarf.getSymbolName(regs.ip) orelse "???";
+            if (!std.mem.eql(u8, old_name, name)) {
+                std.debug.print("Name: {?s}\n", .{name});
+                regs.printDiff(old_regs);
+                old_regs = regs;
+                old_name = name;
+                break;
+            }
         }
-        if (std.mem.startsWith(u8, "step", command)) {
-            step(debugge_pid) catch |err| {
-                std.log.err("Failed to continue execution: {s}", .{@errorName(err)});
-            };
-        }
-        const regs = getRegisters(debugge_pid) catch |err| {
-            std.log.err("Failed to continue execution: {s}", .{@errorName(err)});
-            continue;
-        };
-        regs.printDiff(old_regs);
-        old_regs = regs;
     }
 }
 
@@ -205,4 +185,48 @@ fn elfGetSectionStringTable(alloc: std.mem.Allocator, elf_header: std.elf.Header
         }
     }
     return null;
+}
+
+fn readDwarf(
+    arena: std.mem.Allocator,
+    file: std.fs.File,
+) !std.debug.Dwarf {
+    const elf_header = try std.elf.Header.read(file);
+
+    const table = try elfGetSectionStringTable(arena, elf_header, file) orelse {
+        std.log.err("Can't find string table", .{});
+        return error.NoStringTable;
+    };
+
+    var iter = elf_header.section_header_iterator(file);
+    var sections_array = std.debug.Dwarf.null_section_array;
+    while (try iter.next()) |section| {
+        if (section.sh_type != std.elf.SHT_NULL) {
+            const name = std.mem.span(@as([*:0]u8, @ptrCast(&table[section.sh_name])));
+            const id = std.meta.stringToEnum(
+                std.debug.Dwarf.Section.Id,
+                name[1..],
+            ) orelse continue; // Remove .
+            const buf = try arena.alloc(u8, section.sh_size);
+            try file.seekTo(section.sh_offset);
+            _ = try file.readAll(buf);
+            sections_array[@intFromEnum(id)] = std.debug.Dwarf.Section{
+                .data = buf,
+                .virtual_address = null,
+                .owned = false,
+            };
+
+            std.debug.print("Read {any}\n", .{id});
+        }
+    }
+
+    var dwarf = std.debug.Dwarf{
+        .sections = sections_array,
+        .endian = .little,
+        .is_macho = false,
+    };
+    try dwarf.open(arena);
+    try dwarf.populateRanges(arena);
+
+    return dwarf;
 }
